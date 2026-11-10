@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+build/
+dist/
+release/
+*.spec
+Editor-Darkmode-MK1.ini
+*.zip

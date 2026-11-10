@@ -1,0 +1,2 @@
+# Nur für den Build der exe nötig – das Programm selbst nutzt ausschließlich die Standardbibliothek.
+pyinstaller>=6.6

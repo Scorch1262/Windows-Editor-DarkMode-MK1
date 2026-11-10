@@ -1,0 +1,79 @@
+name: Build Windows EXE
+
+# Läuft bei jedem Push und manuell (Actions › "Run workflow").
+# Ein GitHub-Release wird nur erzeugt, wenn es für die Versionsnummer
+# (APP_VERSION in editor_darkmode.py) noch kein Release gibt.
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Quellcode holen
+        uses: actions/checkout@v4
+
+      - name: Python einrichten
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build-Werkzeuge installieren
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-build.txt
+
+      - name: Version auslesen
+        id: ver
+        shell: pwsh
+        run: |
+          $v = (python tools/make_version_info.py).Trim()
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "Version: $v"
+
+      - name: EXE bauen (PyInstaller)
+        shell: pwsh
+        run: |
+          python -m PyInstaller --noconfirm --clean --onefile --windowed `
+            --name Editor-Darkmode-MK1 `
+            --icon assets/editor.ico `
+            --add-data "assets/editor.ico;assets" `
+            --version-file build/version_info.txt `
+            editor_darkmode.py
+
+      - name: Paket schnüren
+        shell: pwsh
+        run: |
+          $v = "${{ steps.ver.outputs.version }}"
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          Copy-Item dist/Editor-Darkmode-MK1.exe release/
+          Copy-Item README.md release/
+          Compress-Archive -Path release/* -DestinationPath "Editor-Darkmode-MK1-v$v-windows.zip" -Force
+
+      - name: Artefakt hochladen
+        uses: actions/upload-artifact@v4
+        with:
+          name: Editor-Darkmode-MK1-v${{ steps.ver.outputs.version }}-windows
+          path: release/
+
+      - name: Release erstellen (nur bei neuer Version)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v${{ steps.ver.outputs.version }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG existiert bereits – es wird kein neues Release erstellt."
+            exit 0
+          fi
+          gh release create "$TAG" \
+            "Editor-Darkmode-MK1-$TAG-windows.zip" \
+            "dist/Editor-Darkmode-MK1.exe" \
+            --target "$GITHUB_SHA" \
+            --title "Editor-Darkmode-MK1 $TAG" \
+            --notes "Windows-Build von Editor-Darkmode-MK1 $TAG (Nachbau des Windows-10-Editors mit Dark Mode)."
