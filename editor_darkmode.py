@@ -29,7 +29,7 @@ from tkinter import font as tkfont
 
 APP_TITLE = "Editor"
 APP_ID = "Editor-Darkmode-MK1"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 IS_WIN = sys.platform.startswith("win")
 
@@ -128,6 +128,142 @@ def dark_titlebar(win):
             hwnd, 35, ctypes.byref(color), ctypes.sizeof(color))
     except Exception:
         pass
+
+
+def work_area(widget, x, y):
+    """Arbeitsbereich (ohne Taskleiste) des Monitors, auf dem (x, y) liegt."""
+    if IS_WIN:
+        try:
+            from ctypes import wintypes
+
+            class MONITORINFO(ctypes.Structure):
+                _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                            ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+
+            user32 = ctypes.windll.user32
+            user32.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
+            user32.MonitorFromPoint.restype = wintypes.HANDLE
+            user32.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MONITORINFO)]
+            hmon = user32.MonitorFromPoint(wintypes.POINT(int(x), int(y)), 2)
+            info = MONITORINFO()
+            info.cbSize = ctypes.sizeof(MONITORINFO)
+            if user32.GetMonitorInfoW(hmon, ctypes.byref(info)):
+                r = info.rcWork
+                return r.left, r.top, r.right, r.bottom
+        except Exception:
+            pass
+    return 0, 0, widget.winfo_screenwidth(), widget.winfo_screenheight()
+
+
+class FileDropTarget:
+    """
+    Nimmt per Drag & Drop aus dem Explorer gezogene Dateien an (WM_DROPFILES).
+    Die Fensterprozeduren der Tk-Fenster werden dazu per ctypes umgeleitet.
+    Im Callback wird bewusst kein Tk aufgerufen – die Dateien landen in einer
+    Warteschlange, die das Hauptfenster regelmäßig abholt.
+    """
+    WM_DROPFILES = 0x0233
+    WM_COPYDATA = 0x004A
+    WM_COPYGLOBALDATA = 0x0049
+    MSGFLT_ALLOW = 1
+    GWLP_WNDPROC = -4
+
+    def __init__(self):
+        self.queue = []
+        self._hooks = {}
+        self.available = False
+        if not IS_WIN:
+            return
+        try:
+            from ctypes import wintypes
+            lresult = ctypes.c_ssize_t
+            self.WNDPROC = ctypes.WINFUNCTYPE(lresult, wintypes.HWND, wintypes.UINT,
+                                              wintypes.WPARAM, wintypes.LPARAM)
+            u = ctypes.WinDLL("user32", use_last_error=True)
+            s = ctypes.WinDLL("shell32")
+            self._set = getattr(u, "SetWindowLongPtrW", None) or u.SetWindowLongW
+            self._set.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+            self._set.restype = ctypes.c_void_p
+            self._call = u.CallWindowProcW
+            self._call.argtypes = [ctypes.c_void_p, wintypes.HWND, wintypes.UINT,
+                                   wintypes.WPARAM, wintypes.LPARAM]
+            self._call.restype = lresult
+            self._parent = u.GetParent
+            self._parent.argtypes = [wintypes.HWND]
+            self._parent.restype = wintypes.HWND
+            self._filter = getattr(u, "ChangeWindowMessageFilterEx", None)
+            if self._filter is not None:
+                self._filter.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.DWORD,
+                                         ctypes.c_void_p]
+            self._accept = s.DragAcceptFiles
+            self._accept.argtypes = [wintypes.HWND, wintypes.BOOL]
+            self._query = s.DragQueryFileW
+            self._query.argtypes = [ctypes.c_void_p, wintypes.UINT, ctypes.c_wchar_p,
+                                    wintypes.UINT]
+            self._query.restype = wintypes.UINT
+            self._finish = s.DragFinish
+            self._finish.argtypes = [ctypes.c_void_p]
+            self.available = True
+        except Exception:
+            self.available = False
+
+    def register(self, widget, include_frame=False):
+        """Fenster eines Tk-Widgets (optional samt äußerem Rahmenfenster) anmelden."""
+        if not self.available:
+            return
+        try:
+            widget.update_idletasks()
+            hwnd = widget.winfo_id()
+            self._hook(hwnd)
+            if include_frame:
+                outer = self._parent(hwnd)
+                if outer:
+                    self._hook(outer)
+        except Exception:
+            pass
+
+    def _hook(self, hwnd):
+        if not hwnd or hwnd in self._hooks:
+            return
+        self._accept(hwnd, True)
+        if self._filter is not None:  # Drag & Drop auch bei "Als Administrator ausführen"
+            for msg in (self.WM_DROPFILES, self.WM_COPYDATA, self.WM_COPYGLOBALDATA):
+                try:
+                    self._filter(hwnd, msg, self.MSGFLT_ALLOW, None)
+                except Exception:
+                    pass
+        entry = {}
+
+        def proc(h, msg, wparam, lparam):
+            if msg == self.WM_DROPFILES:
+                try:
+                    self.queue.extend(self._read_drop(wparam))
+                except Exception:
+                    pass
+                return 0
+            return self._call(entry["old"], h, msg, wparam, lparam)
+
+        cb = self.WNDPROC(proc)
+        entry["cb"] = cb  # Referenz halten, sonst räumt Python den Callback weg
+        entry["old"] = self._set(hwnd, self.GWLP_WNDPROC, ctypes.cast(cb, ctypes.c_void_p))
+        self._hooks[hwnd] = entry
+
+    def _read_drop(self, hdrop):
+        files = []
+        try:
+            count = self._query(hdrop, 0xFFFFFFFF, None, 0)
+            for i in range(count):
+                length = self._query(hdrop, i, None, 0)
+                buf = ctypes.create_unicode_buffer(length + 1)
+                self._query(hdrop, i, buf, length + 1)
+                files.append(buf.value)
+        finally:
+            self._finish(hdrop)
+        return files
+
+    def take(self):
+        files, self.queue = self.queue, []
+        return files
 
 
 def decode_bytes(data):
@@ -615,6 +751,381 @@ class AboutDialog(DarkDialog):
 
 
 # ---------------------------------------------------------------------------
+# Eigene Dropdown-Menüs (komplett dunkel, ohne weißen Windows-Rahmen)
+# ---------------------------------------------------------------------------
+class DarkMenu:
+    """Beschreibung eines Menüs – angezeigt wird es vom MenuManager."""
+
+    def __init__(self):
+        self.items = []
+
+    def add_command(self, label, command=None, accelerator=""):
+        self.items.append({"kind": "command", "label": label, "command": command,
+                           "accel": accelerator, "state": "normal"})
+
+    def add_checkbutton(self, label, variable, command=None, accelerator=""):
+        self.items.append({"kind": "check", "label": label, "variable": variable,
+                           "command": command, "accel": accelerator, "state": "normal"})
+
+    def add_radiobutton(self, label, value, variable, command=None):
+        self.items.append({"kind": "radio", "label": label, "value": value,
+                           "variable": variable, "command": command, "accel": "",
+                           "state": "normal"})
+
+    def add_cascade(self, label, menu):
+        self.items.append({"kind": "cascade", "label": label, "menu": menu, "accel": "",
+                           "state": "normal"})
+
+    def add_separator(self):
+        self.items.append({"kind": "sep"})
+
+    def entryconfigure(self, label, state=None):
+        for it in self.items:
+            if it.get("label") == label and state is not None:
+                it["state"] = state
+
+
+class MenuView:
+    """Ein geöffnetes Menüfenster."""
+
+    def __init__(self, mgr, menu):
+        self.mgr = mgr
+        self.menu = menu
+        self.rows = []
+        self.active = None
+        self.sub = None
+        win = self.win = tk.Toplevel(mgr.root)
+        win.withdraw()
+        win.overrideredirect(True)
+        win.configure(bg=C["border"], bd=0, highlightthickness=0)
+        try:
+            win.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        inner = tk.Frame(win, bg=C["card"], bd=0, highlightthickness=0)
+        inner.pack(padx=1, pady=1, fill="both", expand=True)  # 1 px Rahmen in Border-Farbe
+        inner.columnconfigure(1, weight=1, minsize=110)
+        tk.Frame(inner, bg=C["card"], height=4).grid(row=0, column=0, columnspan=4)
+        r = 1
+        for it in menu.items:
+            if it["kind"] == "sep":
+                tk.Frame(inner, bg=C["border"], height=1).grid(
+                    row=r, column=0, columnspan=4, sticky="ew", padx=10, pady=4)
+                r += 1
+                continue
+            disabled = it.get("state") == "disabled"
+            fg = C["faint"] if disabled else C["text"]
+            mark, mark_font = "", UI_FONT
+            if it["kind"] == "check" and it["variable"].get():
+                mark = "✓"
+            elif it["kind"] == "radio" and it["variable"].get() == it["value"]:
+                mark, mark_font = "●", (UI_FAMILY, 7)
+            cells = [
+                tk.Label(inner, text=mark, font=mark_font, width=3, anchor="center",
+                         fg=C["faint"] if disabled else C["accent"]),
+                tk.Label(inner, text=it["label"], font=UI_FONT, anchor="w", fg=fg,
+                         padx=2, pady=4),
+                tk.Label(inner, text=it.get("accel", ""), font=UI_FONT, anchor="e",
+                         fg=C["faint"] if disabled else C["dim"], padx=12),
+                tk.Label(inner, text="›" if it["kind"] == "cascade" else "",
+                         font=(UI_FAMILY, 10), width=2, anchor="w", fg=fg),
+            ]
+            row = {"item": it, "cells": cells, "disabled": disabled}
+            for col, cell in enumerate(cells):
+                cell.configure(bg=C["card"], bd=0, highlightthickness=0)
+                cell.grid(row=r, column=col, sticky="nsew")
+                cell._menu_row = row
+                cell._menu_view = self
+            self.rows.append(row)
+            r += 1
+        tk.Frame(inner, bg=C["card"], height=4).grid(row=r, column=0, columnspan=4)
+
+    def show(self, x, y, flip_y=None, alt_x=None):
+        """Zeigt das Menü bei (x, y) und hält es innerhalb des Monitors."""
+        w = self.win
+        w.update_idletasks()
+        width, height = w.winfo_reqwidth(), w.winfo_reqheight()
+        left, top, right, bottom = work_area(w, x, y)
+        if x + width > right:
+            x = (alt_x - width) if alt_x is not None else right - width
+        if y + height > bottom:
+            y = (flip_y - height) if flip_y is not None else bottom - height
+        x, y = max(left, x), max(top, y)
+        w.geometry("+%d+%d" % (x, y))
+        w.deiconify()
+        w.lift()
+
+    def set_active(self, row):
+        if row is self.active:
+            return
+        if self.active is not None:
+            for c in self.active["cells"]:
+                c.configure(bg=C["card"])
+        self.active = row
+        if row is not None:
+            bg = C["hover"] if row["disabled"] else C["sel"]
+            for c in row["cells"]:
+                c.configure(bg=bg)
+
+    def move(self, step):
+        if not self.rows:
+            return
+        if self.active is None:
+            idx = 0 if step > 0 else len(self.rows) - 1
+        else:
+            idx = (self.rows.index(self.active) + step) % len(self.rows)
+        self.set_active(self.rows[idx])
+
+    def destroy(self):
+        try:
+            self.win.destroy()
+        except tk.TclError:
+            pass
+
+
+class MenuManager:
+    """Öffnet/schließt Menüs, Maus- und Tastatursteuerung wie unter Windows."""
+
+    def __init__(self, app):
+        self.app = app
+        self.root = app.root
+        self.chain = []
+        self.bar_index = None
+        self._job = None
+
+    @property
+    def is_open(self):
+        return bool(self.chain)
+
+    # -- Öffnen ---------------------------------------------------------
+    def open_bar(self, idx, keyboard=False):
+        self.close_all(refocus=False)
+        lbl, menu, before = self.app.menu_labels[idx]
+        if before:
+            before()
+        self.bar_index = idx
+        lbl.configure(bg=C["pressed"])
+        x = lbl.winfo_rootx()
+        y = lbl.winfo_rooty() + lbl.winfo_height()
+        self._open_root(menu, x, y, flip_y=lbl.winfo_rooty(), keyboard=keyboard)
+
+    def popup(self, menu, x, y, above=False):
+        self.close_all(refocus=False)
+        view = MenuView(self, menu)
+        if above:
+            view.win.update_idletasks()
+            y -= view.win.winfo_reqheight()
+        self._start(view, x, y, flip_y=y)
+
+    def _open_root(self, menu, x, y, flip_y=None, keyboard=False):
+        view = MenuView(self, menu)
+        self._start(view, x, y, flip_y=flip_y)
+        if keyboard:
+            view.move(1)
+
+    def _start(self, view, x, y, flip_y=None):
+        self.chain = [view]
+        self._bind(view)
+        view.show(x, y, flip_y=flip_y)
+        self._grab(view, 0)
+
+    def _grab(self, view, tries):
+        if view not in self.chain:
+            return
+        try:
+            view.win.grab_set()
+            view.win.focus_force()
+        except tk.TclError:
+            if tries < 10:
+                view.win.after(20, lambda: self._grab(view, tries + 1))
+
+    def _open_sub(self, view, row, keyboard=False):
+        self._cancel_job()
+        self._close_after(view)
+        if row["disabled"] or row["item"]["kind"] != "cascade":
+            return
+        sub = MenuView(self, row["item"]["menu"])
+        self._bind(sub)
+        cell = row["cells"][0]
+        sub.show(view.win.winfo_rootx() + view.win.winfo_width() - 3,
+                 cell.winfo_rooty() - 5, alt_x=view.win.winfo_rootx() + 3)
+        view.sub = sub
+        self.chain.append(sub)
+        if keyboard:
+            sub.move(1)
+
+    # -- Schließen ------------------------------------------------------
+    def _close_after(self, view):
+        while self.chain and self.chain[-1] is not view:
+            self.chain.pop().destroy()
+        view.sub = None
+
+    def close_all(self, refocus=True):
+        self._cancel_job()
+        had = bool(self.chain)
+        for v in reversed(self.chain):
+            v.destroy()
+        self.chain = []
+        if self.bar_index is not None:
+            try:
+                self.app.menu_labels[self.bar_index][0].configure(bg=C["panel"])
+            except tk.TclError:
+                pass
+        self.bar_index = None
+        if had and refocus:
+            try:
+                self.app.text.focus_set()
+            except tk.TclError:
+                pass
+
+    def _cancel_job(self):
+        if self._job is not None:
+            try:
+                self.root.after_cancel(self._job)
+            except tk.TclError:
+                pass
+            self._job = None
+
+    # -- Ereignisse -----------------------------------------------------
+    def _bind(self, view):
+        w = view.win
+        w.bind("<Motion>", self._on_motion)
+        w.bind("<ButtonPress-1>", self._on_press)
+        w.bind("<ButtonPress-3>", self._on_press)
+        w.bind("<ButtonRelease-1>", self._on_release)
+        w.bind("<FocusOut>", lambda e: self.root.after(80, self._check_focus))
+        for key, fn in (("<Down>", lambda: self._key_move(1)), ("<Up>", lambda: self._key_move(-1)),
+                        ("<Right>", self._key_right), ("<Left>", self._key_left),
+                        ("<Return>", self._key_enter), ("<KP_Enter>", self._key_enter),
+                        ("<space>", self._key_enter), ("<Escape>", self._key_escape),
+                        ("<F10>", self.close_all)):
+            w.bind(key, lambda e, f=fn: (f(), "break")[1])
+
+    def _widget_at(self, x, y):
+        try:
+            return self.root.winfo_containing(x, y)
+        except (KeyError, tk.TclError):
+            return None
+
+    @staticmethod
+    def _row_of(widget):
+        while widget is not None:
+            if hasattr(widget, "_menu_row"):
+                return widget._menu_row, widget._menu_view
+            widget = getattr(widget, "master", None)
+        return None, None
+
+    def _bar_index_of(self, widget):
+        for i, (lbl, _m, _b) in enumerate(self.app.menu_labels):
+            if widget is lbl:
+                return i
+        return None
+
+    def _in_menu(self, widget):
+        while widget is not None:
+            if any(widget is v.win for v in self.chain):
+                return True
+            widget = getattr(widget, "master", None)
+        return False
+
+    def _on_motion(self, e):
+        if not self.chain:
+            return
+        w = self._widget_at(e.x_root, e.y_root)
+        row, view = self._row_of(w)
+        if row is not None and view in self.chain:
+            if view.active is not row:
+                view.set_active(row)
+                self._cancel_job()
+                if view.sub is not None:
+                    self._close_after(view)
+                if row["item"]["kind"] == "cascade" and not row["disabled"]:
+                    self._job = self.root.after(180, lambda: self._open_sub(view, row))
+            return
+        idx = self._bar_index_of(w)
+        if idx is not None and self.bar_index is not None and idx != self.bar_index:
+            self.open_bar(idx)
+
+    def _on_press(self, e):
+        w = self._widget_at(e.x_root, e.y_root)
+        if self._in_menu(w):
+            return "break"
+        idx = self._bar_index_of(w)
+        if idx is not None and idx != self.bar_index:
+            self.open_bar(idx)
+        else:
+            self.close_all()
+        return "break"
+
+    def _on_release(self, e):
+        w = self._widget_at(e.x_root, e.y_root)
+        row, view = self._row_of(w)
+        if row is None or view not in self.chain:
+            return "break"
+        self._activate(view, row, keyboard=False)
+        return "break"
+
+    def _activate(self, view, row, keyboard):
+        if row["disabled"]:
+            return
+        it = row["item"]
+        if it["kind"] == "cascade":
+            self._open_sub(view, row, keyboard=keyboard)
+            return
+        self.close_all()
+
+        def run():
+            if it["kind"] == "check":
+                it["variable"].set(not it["variable"].get())
+            elif it["kind"] == "radio":
+                it["variable"].set(it["value"])
+            if it.get("command"):
+                it["command"]()
+
+        self.root.after_idle(run)
+
+    def _check_focus(self):
+        if not self.chain:
+            return
+        try:
+            f = self.root.focus_get()
+        except (KeyError, tk.TclError):
+            f = None
+        if f is None or not self._in_menu(f):
+            self.close_all(refocus=False)
+
+    # -- Tastatur -------------------------------------------------------
+    def _key_move(self, step):
+        if self.chain:
+            self.chain[-1].move(step)
+
+    def _key_right(self):
+        if not self.chain:
+            return
+        v = self.chain[-1]
+        if v.active is not None and v.active["item"]["kind"] == "cascade":
+            self._open_sub(v, v.active, keyboard=True)
+        elif self.bar_index is not None:
+            self.open_bar((self.bar_index + 1) % len(self.app.menu_labels), keyboard=True)
+
+    def _key_left(self):
+        if len(self.chain) > 1:
+            self._close_after(self.chain[-2])
+        elif self.bar_index is not None:
+            self.open_bar((self.bar_index - 1) % len(self.app.menu_labels), keyboard=True)
+
+    def _key_enter(self):
+        if self.chain and self.chain[-1].active is not None:
+            self._activate(self.chain[-1], self.chain[-1].active, keyboard=True)
+
+    def _key_escape(self):
+        if len(self.chain) > 1:
+            self._close_after(self.chain[-2])
+        else:
+            self.close_all()
+
+
+# ---------------------------------------------------------------------------
 # Hauptfenster
 # ---------------------------------------------------------------------------
 class EditorApp:
@@ -626,7 +1137,8 @@ class EditorApp:
         self.eol = "CRLF"
         self.find_dialog = None
         self._last_state = None
-        self._menu_open = False
+        self.menus = MenuManager(self)
+        self.drop = FileDropTarget()
 
         s = self.settings
         self.zoom = s.getint("zoom", ZOOM_MIN, ZOOM_MAX)
@@ -662,6 +1174,10 @@ class EditorApp:
         self.apply_wrap()
         self.apply_statusbar()
         self._apply_tabs()
+        # Dateien per Drag & Drop auf das Fenster ziehen
+        self.drop.register(self.root, include_frame=True)
+        self.drop.register(self.text)
+        self.drop.register(self.statusbar)
 
         if path:
             # erst nach dem Anzeigen des Fensters öffnen (Rückfragen brauchen ein sichtbares Fenster)
@@ -773,23 +1289,14 @@ class EditorApp:
         idx = len(self.menu_labels)
         self.menu_labels.append((lbl, menu, before_post))
         lbl.bind("<Enter>", lambda e: lbl.configure(bg=C["hover"]))
-        lbl.bind("<Leave>", lambda e: (not self._menu_open) and lbl.configure(bg=C["panel"]))
+        lbl.bind("<Leave>", lambda e: self.menus.bar_index != idx and lbl.configure(bg=C["panel"]))
         lbl.bind("<Button-1>", lambda e, i=idx: self.open_menu(i))
 
-    def open_menu(self, idx):
-        lbl, menu, before_post = self.menu_labels[idx]
-        if before_post:
-            before_post()
-        self._menu_open = True
-        lbl.configure(bg=C["pressed"])
-        x = lbl.winfo_rootx()
-        y = lbl.winfo_rooty() + lbl.winfo_height()
-        try:
-            menu.tk_popup(x, y)
-        finally:
-            menu.grab_release()
-            self._menu_open = False
-            lbl.configure(bg=C["panel"])
+    def open_menu(self, idx, keyboard=False):
+        if self.menus.bar_index == idx:
+            self.menus.close_all()
+        else:
+            self.menus.open_bar(idx, keyboard=keyboard)
         return "break"
 
     def _build_editor(self):
@@ -839,18 +1346,16 @@ class EditorApp:
         self.lbl_eol = field(15)
         self.lbl_zoom = field(6)
         self.lbl_pos = field(22)
-        self.lbl_enc.bind("<Button-1>", lambda e: self._popup_at(self.m_enc, e))
-        self.lbl_eol.bind("<Button-1>", lambda e: self._popup_at(self.m_eol, e))
+        self.lbl_enc.bind("<Button-1>", lambda e: self._popup_above(self.m_enc, self.lbl_enc))
+        self.lbl_eol.bind("<Button-1>", lambda e: self._popup_above(self.m_eol, self.lbl_eol))
         self.lbl_zoom.bind("<Button-1>", lambda e: self.zoom_reset())
         for lbl in (self.lbl_enc, self.lbl_eol, self.lbl_zoom):
             lbl.bind("<Enter>", lambda e: e.widget.configure(fg=C["text"], bg=C["hover"]))
             lbl.bind("<Leave>", lambda e: e.widget.configure(fg=C["dim"], bg=C["panel"]))
 
-    def _menu(self, parent=None):
-        return tk.Menu(parent or self.root, tearoff=0, bg=C["card"], fg=C["text"],
-                       activebackground=C["sel"], activeforeground=C["text"],
-                       disabledforeground=C["faint"], selectcolor=C["accent"],
-                       activeborderwidth=0, bd=1, relief="flat", font=UI_FONT)
+    @staticmethod
+    def _menu(parent=None):
+        return DarkMenu()
 
     def _build_menus(self):
         # Datei
@@ -968,11 +1473,9 @@ class EditorApp:
         except tk.TclError:
             pass
 
-    def _popup_at(self, menu, event):
-        try:
-            menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            menu.grab_release()
+    def _popup_above(self, menu, widget):
+        self.menus.popup(menu, widget.winfo_rootx(), widget.winfo_rooty(), above=True)
+        return "break"
 
     # ---------------------------------------------------------------- Tasten
     def _bind_keys(self):
@@ -1020,20 +1523,22 @@ class EditorApp:
         for idx, (lbl, _m, _p) in enumerate(self.menu_labels):
             ch = lbl.cget("text")[lbl.cget("underline")].lower()
             for seq in ("<Alt-%s>" % ch, "<Alt-%s>" % ch.upper()):
-                self.root.bind_all(seq, lambda e, i=idx: self.open_menu(i))
-        t.bind("<F10>", lambda e: self.open_menu(0))
+                self.root.bind_all(seq, lambda e, i=idx: self.open_menu(i, keyboard=True))
+        t.bind("<F10>", lambda e: self.open_menu(0, keyboard=True))
 
     def _context_menu(self, event):
         if not self.text.tag_ranges("sel"):
             self.text.mark_set("insert", "@%d,%d" % (event.x, event.y))
         self._update_edit_menu()
         self.text.focus_set()
-        self._popup_at(self.m_ctx, event)
+        self.menus.popup(self.m_ctx, event.x_root, event.y_root)
         return "break"
 
     # ---------------------------------------------------------------- Status
     def _poll(self):
         try:
+            if self.drop.queue:
+                self._process_drop()
             state = (self.text.index("insert"), self.text.edit_modified(), self.zoom,
                      self.encoding, self.eol, self.path)
             if state != self._last_state:
@@ -1087,12 +1592,14 @@ class EditorApp:
         self.v_eol.set(self.eol)
         self._set_content("")
 
-    def new_window(self):
+    def new_window(self, path=None):
         try:
             if getattr(sys, "frozen", False):
                 cmd = [sys.executable]
             else:
                 cmd = [sys.executable, os.path.abspath(__file__)]
+            if path:
+                cmd.append(path)
             flags = 0x00000008 if IS_WIN else 0  # DETACHED_PROCESS
             subprocess.Popen(cmd, cwd=app_dir(), creationflags=flags, close_fds=True)
         except Exception as exc:
@@ -1124,6 +1631,31 @@ class EditorApp:
         self.path = os.path.abspath(path)
         self._set_content(normalize_eol(text))
         return True
+
+    def _process_drop(self):
+        """Abgelegte Dateien öffnen: erste in diesem Fenster, weitere in neuen Fenstern."""
+        if self.menus.is_open:
+            self.menus.close_all()
+        if self.root.grab_current() is not None:
+            return  # gerade ist ein Dialog offen – später erneut versuchen
+        dropped = self.drop.take()
+        files = [f for f in dropped if os.path.isfile(f)]
+        if not files:
+            if dropped:
+                show_message(self.root, "Ordner können nicht geöffnet werden.\n"
+                                        "Bitte eine oder mehrere Dateien ziehen.", kind="warn")
+            return
+        try:
+            self.root.deiconify()
+            self.root.lift()
+            self.root.focus_force()
+        except tk.TclError:
+            pass
+        if self.confirm_discard():
+            self.load_file(files[0])
+        for extra in files[1:]:
+            self.new_window(extra)
+        self.text.focus_set()
 
     def _open_from_cmdline(self, path):
         if os.path.isfile(path):

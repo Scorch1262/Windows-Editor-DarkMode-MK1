@@ -3,7 +3,7 @@
 Nachbau des **Windows-10-Editors (Notepad)** mit dunkler Oberfläche im Stil der Dashboards –
 dunkler Grund, Teal-Akzent, Amber-Cursor.
 
-**Version:** 1.0.0
+**Version:** 1.1.0
 
 ![Screenshot](docs/screenshot.png)
 
@@ -25,6 +25,12 @@ Aufbau und Menüs wie im Original:
 * Codierungen: UTF-8, UTF-8 mit BOM, UTF-16 LE/BE, ANSI (Windows-1252) – automatische Erkennung beim Öffnen.
 * Zeilenenden: Windows (CRLF), Unix (LF), Macintosh (CR) – werden erkannt und beim Speichern beibehalten.
 * Dunkle Titelleiste (Windows 10 ab 1809 / Windows 11), dunkle Dialoge, schmale Scrollbalken.
+* Eigene, komplett dunkle Dropdown-Menüs ohne weißen Windows-Rahmen – bedienbar mit Maus
+  (Hover-Wechsel zwischen den Menüs) und Tastatur (Pfeiltasten, Enter, Esc).
+* **Drag & Drop:** Dateien aus dem Explorer einfach auf ein offenes Editor-Fenster ziehen.
+  Die erste Datei öffnet sich im Fenster (bei ungespeicherten Änderungen kommt vorher die
+  Speichern-Rückfrage), weitere Dateien öffnen sich jeweils in einem neuen Fenster.
+  Funktioniert auch, wenn der Editor als Administrator läuft.
 * Zoom auch mit **Strg + Mausrad**.
 * Aufruf mit Dateipfad (`Editor-Darkmode-MK1.exe datei.txt`) öffnet die Datei direkt – damit funktioniert auch „Öffnen mit …“.
 
