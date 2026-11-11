@@ -29,7 +29,7 @@ from tkinter import font as tkfont
 
 APP_TITLE = "Editor"
 APP_ID = "Editor-Darkmode-MK1"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 IS_WIN = sys.platform.startswith("win")
 
@@ -1483,7 +1483,10 @@ class EditorApp:
 
         def bind(seqs, func):
             for seq in seqs:
-                t.bind(seq, lambda e, f=func: (f(e), "break")[1])
+                try:
+                    t.bind(seq, lambda e, f=func: (f(e), "break")[1])
+                except tk.TclError:
+                    pass  # Tastenname auf dieser Plattform unbekannt
 
         def shift(e):
             return bool(e.state & 0x0001)
@@ -1502,6 +1505,12 @@ class EditorApp:
         bind(("<Control-g>", "<Control-G>"), lambda e: self.goto_line())
         bind(("<Control-a>", "<Control-A>", "<Control-slash>"), lambda e: self.select_all())
         bind(("<F5>",), lambda e: self.insert_datetime())
+        # Tab-Taste wie im Windows-Editor: Tab und Umschalt+Tab fügen einen
+        # Tabulator ein (Tk würde bei Umschalt/Strg+Tab den Fokus wechseln).
+        bind(("<Tab>", "<Shift-Tab>", "<ISO_Left_Tab>", "<Shift-ISO_Left_Tab>"),
+             lambda e: self.insert_tab())
+        bind(("<Control-Tab>", "<Control-Shift-Tab>",
+              "<Control-ISO_Left_Tab>", "<Control-Shift-ISO_Left_Tab>"), lambda e: None)
         bind(("<F3>",), lambda e: self.find_next())
         bind(("<Shift-F3>",), lambda e: self.find_previous())
         bind(("<Control-plus>", "<Control-equal>", "<Control-KP_Add>"),
@@ -1984,7 +1993,27 @@ class EditorApp:
         return max(1, int(round(self.base_size * self.zoom / 100.0)))
 
     def _apply_tabs(self):
-        self.text.configure(tabs=(self.font.measure(" " * 8),))
+        """
+        Tabstopps wie im Windows-Editor: alle 8 Zeichen (gemessen an der
+        durchschnittlichen Zeichenbreite der Schrift) und ein Tab springt immer
+        zum nächsten Tabstopp rechts der aktuellen Position ("wordprocessor").
+        Tk-Standard ("tabular") würde den n-ten Tab fest dem n-ten Tabstopp
+        zuordnen – dann rutscht Text nach langen Wörtern falsch zusammen.
+        """
+        sample = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        avg = self.font.measure(sample) / float(len(sample))
+        width = max(1, int(round(avg * 8)))
+        self.text.configure(tabs=(width,), tabstyle="wordprocessor")
+
+    def insert_tab(self):
+        """Tab wie im Original: Markierung wird durch einen Tabulator ersetzt."""
+        t = self.text
+        if t.tag_ranges("sel"):
+            first = t.index("sel.first")
+            t.delete("sel.first", "sel.last")
+            t.mark_set("insert", first)
+        t.insert("insert", "\t")
+        t.see("insert")
 
     def _set_zoom(self, value):
         self.zoom = max(ZOOM_MIN, min(ZOOM_MAX, value))
