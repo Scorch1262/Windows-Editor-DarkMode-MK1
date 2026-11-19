@@ -3,7 +3,7 @@
 Nachbau des **Windows-10-Editors (Notepad)** mit dunkler Oberfläche im Stil der Dashboards –
 dunkler Grund, Teal-Akzent, Amber-Cursor.
 
-**Version:** 1.2.0
+**Version:** 1.3.0
 
 ![Screenshot](docs/screenshot.png)
 
@@ -29,6 +29,8 @@ Aufbau und Menüs wie im Original:
   (Hover-Wechsel zwischen den Menüs) und Tastatur (Pfeiltasten, Enter, Esc).
 * Tabulatoren wie im Original: Tabstopps alle 8 Zeichen, ein Tab springt immer zur
   nächsten Tabstopp-Spalte; Tab und Umschalt+Tab fügen einen Tab ein und ersetzen eine Markierung.
+* Kopierter oder ausgeschnittener Text bleibt nach dem Schließen des Editors in der
+  Zwischenablage und kann woanders eingefügt werden (wie im Original).
 * **Drag & Drop:** Dateien aus dem Explorer einfach auf ein offenes Editor-Fenster ziehen.
   Die erste Datei öffnet sich im Fenster (bei ungespeicherten Änderungen kommt vorher die
   Speichern-Rückfrage), weitere Dateien öffnen sich jeweils in einem neuen Fenster.

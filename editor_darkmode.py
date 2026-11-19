@@ -29,7 +29,7 @@ from tkinter import font as tkfont
 
 APP_TITLE = "Editor"
 APP_ID = "Editor-Darkmode-MK1"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 
 IS_WIN = sys.platform.startswith("win")
 
@@ -128,6 +128,84 @@ def dark_titlebar(win):
             hwnd, 35, ctypes.byref(color), ctypes.sizeof(color))
     except Exception:
         pass
+
+
+def _win_clipboard_api():
+    from ctypes import wintypes
+    u = ctypes.windll.user32
+    k = ctypes.windll.kernel32
+    u.OpenClipboard.argtypes = [wintypes.HWND]
+    u.OpenClipboard.restype = wintypes.BOOL
+    u.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+    u.SetClipboardData.restype = wintypes.HANDLE
+    u.GetClipboardOwner.restype = wintypes.HWND
+    u.GetParent.argtypes = [wintypes.HWND]
+    u.GetParent.restype = wintypes.HWND
+    u.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    k.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+    k.GlobalAlloc.restype = wintypes.HGLOBAL
+    k.GlobalLock.argtypes = [wintypes.HGLOBAL]
+    k.GlobalLock.restype = ctypes.c_void_p
+    k.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+    k.GlobalFree.argtypes = [wintypes.HGLOBAL]
+    return u, k
+
+
+def win_set_clipboard_text(text, hwnd=None):
+    """
+    Schreibt Text direkt (CF_UNICODETEXT) in die Windows-Zwischenablage.
+    Tk legt beim Kopieren nur eine "verzögerte" Zwischenablage an, deren Inhalt
+    beim Beenden des Programms verloren geht – so bleibt der Text erhalten.
+    """
+    if not IS_WIN:
+        return False
+    try:
+        import time
+        u, k = _win_clipboard_api()
+        text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
+        data = ctypes.create_unicode_buffer(text)
+        size = ctypes.sizeof(data)
+        for _ in range(10):  # Zwischenablage kann kurz von anderen Programmen belegt sein
+            if u.OpenClipboard(hwnd):
+                break
+            time.sleep(0.02)
+        else:
+            return False
+        try:
+            u.EmptyClipboard()
+            handle = k.GlobalAlloc(0x0002, size)  # GMEM_MOVEABLE
+            if not handle:
+                return False
+            ptr = k.GlobalLock(handle)
+            if not ptr:
+                k.GlobalFree(handle)
+                return False
+            ctypes.memmove(ptr, data, size)
+            k.GlobalUnlock(handle)
+            if not u.SetClipboardData(13, handle):  # CF_UNICODETEXT
+                k.GlobalFree(handle)
+                return False
+            return True
+        finally:
+            u.CloseClipboard()
+    except Exception:
+        return False
+
+
+def win_clipboard_owned_by_us():
+    if not IS_WIN:
+        return False
+    try:
+        from ctypes import wintypes
+        u, _k = _win_clipboard_api()
+        owner = u.GetClipboardOwner()
+        if not owner:
+            return False
+        pid = wintypes.DWORD()
+        u.GetWindowThreadProcessId(owner, ctypes.byref(pid))
+        return pid.value == os.getpid()
+    except Exception:
+        return False
 
 
 def work_area(widget, x, y):
@@ -1505,6 +1583,10 @@ class EditorApp:
         bind(("<Control-g>", "<Control-G>"), lambda e: self.goto_line())
         bind(("<Control-a>", "<Control-A>", "<Control-slash>"), lambda e: self.select_all())
         bind(("<F5>",), lambda e: self.insert_datetime())
+        # Kopieren/Ausschneiden (Strg+C/X, Strg+Einfg, Umschalt+Entf) direkt in die
+        # Windows-Zwischenablage – bleibt auch nach dem Schließen des Editors erhalten.
+        bind(("<<Copy>>",), lambda e: self.copy())
+        bind(("<<Cut>>",), lambda e: self.cut())
         # Tab-Taste wie im Windows-Editor: Tab und Umschalt+Tab fügen einen
         # Tabulator ein (Tk würde bei Umschalt/Strg+Tab den Fokus wechseln).
         bind(("<Tab>", "<Shift-Tab>", "<ISO_Left_Tab>", "<Shift-ISO_Left_Tab>"),
@@ -1784,6 +1866,7 @@ class EditorApp:
         s.set("last_find", self.find_var.get().replace("\n", " "))
         s.set("last_replace", self.replace_var.get().replace("\n", " "))
         s.save()
+        self._keep_clipboard()
         self.root.destroy()
 
     # ---------------------------------------------------------------- Bearbeiten
@@ -1799,11 +1882,42 @@ class EditorApp:
         except tk.TclError:
             pass
 
-    def cut(self):
-        self.text.event_generate("<<Cut>>")
+    def _owner_hwnd(self):
+        if not IS_WIN:
+            return None
+        try:
+            u, _k = _win_clipboard_api()
+            return u.GetParent(self.root.winfo_id()) or self.root.winfo_id()
+        except Exception:
+            return None
+
+    def set_clipboard(self, text):
+        if not win_set_clipboard_text(text, self._owner_hwnd()):
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
 
     def copy(self):
-        self.text.event_generate("<<Copy>>")
+        text = self._selected_text()
+        if text:
+            self.set_clipboard(text)
+
+    def cut(self):
+        text = self._selected_text()
+        if text:
+            self.set_clipboard(text)
+            self.text.delete("sel.first", "sel.last")
+            self.text.see("insert")
+
+    def _keep_clipboard(self):
+        """Vor dem Beenden: von Tk gehaltenen Text dauerhaft in die Zwischenablage legen
+        (betrifft z. B. Kopieren aus den Eingabefeldern der Dialoge)."""
+        if not win_clipboard_owned_by_us():
+            return
+        try:
+            text = self.root.clipboard_get()
+        except tk.TclError:
+            return
+        win_set_clipboard_text(text, self._owner_hwnd())
 
     def paste(self):
         self.text.event_generate("<<Paste>>")
