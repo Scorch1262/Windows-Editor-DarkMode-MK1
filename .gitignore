@@ -3,6 +3,16 @@ __pycache__/
 build/
 dist/
 release/
-*.spec
+.venv_build/
 Editor-Darkmode-MK1.ini
 *.zip
+
+# Offline-Build-Kit: heruntergeladene Pakete und Build-Ergebnisse
+offline_build_kit/offline_pakete/
+offline_build_kit/paketliste_*.txt
+offline_build_kit/venv/
+offline_build_kit/venv_mac/
+offline_build_kit/projekt/
+offline_build_kit/build_tmp/
+offline_build_kit/fertige_exe/
+offline_build_kit/fertige_app/

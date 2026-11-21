@@ -1,14 +1,9 @@
 @echo off
-rem Lokaler Build ohne GitHub Actions (Python 3.10+ muss installiert sein)
+rem Lokaler Windows-Build mit Internet (Python 3.10+ muss installiert sein).
+rem Ohne Internet: Offline-Build-Kit im Ordner offline_build_kit benutzen.
 cd /d "%~dp0"
 python -m pip install -r requirements-build.txt || goto :fehler
-python tools\make_version_info.py || goto :fehler
-python -m PyInstaller --noconfirm --clean --onefile --windowed ^
-  --name Editor-Darkmode-MK1 ^
-  --icon assets\editor.ico ^
-  --add-data "assets\editor.ico;assets" ^
-  --version-file build\version_info.txt ^
-  editor_darkmode.py || goto :fehler
+python -m PyInstaller --noconfirm --clean Editor-Darkmode-MK1.spec || goto :fehler
 echo.
 echo Fertig: dist\Editor-Darkmode-MK1.exe
 pause

@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Liest APP_VERSION aus editor_darkmode.py, schreibt build/version_info.txt
-(Dateieigenschaften der exe) und gibt die Versionsnummer aus.
+Liest APP_VERSION aus editor_darkmode.py und schreibt die Windows-Dateieigenschaften
+der exe (version_info.txt). Wird von Editor-Darkmode-MK1.spec benutzt.
 
-Aufruf:  python tools/make_version_info.py
+Aufruf von Hand:  python tools/make_version_info.py
+  -> gibt nur die Versionsnummer aus (für Skripte / GitHub Actions)
 """
 import os
 import re
@@ -11,22 +12,22 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(ROOT, "editor_darkmode.py")
-OUT_DIR = os.path.join(ROOT, "build")
 
 
-def read_version():
-    with open(SRC, encoding="utf-8") as fh:
+def read_version(src=SRC):
+    with open(src, encoding="utf-8") as fh:
         m = re.search(r'^APP_VERSION\s*=\s*"([0-9]+(?:\.[0-9]+){1,3})"', fh.read(), re.M)
     if not m:
         sys.exit("APP_VERSION nicht gefunden")
     return m.group(1)
 
 
-def main():
-    version = read_version()
+def write_version_file(out_dir, src=SRC):
+    """Schreibt <out_dir>/version_info.txt und gibt den Pfad zurück."""
+    version = read_version(src)
     parts = [int(p) for p in version.split(".")] + [0, 0, 0]
     tup = tuple(parts[:4])
-    os.makedirs(OUT_DIR, exist_ok=True)
+    os.makedirs(out_dir, exist_ok=True)
     text = """# UTF-8
 VSVersionInfo(
   ffi=FixedFileInfo(filevers=%(tup)s, prodvers=%(tup)s, mask=0x3f, flags=0x0,
@@ -43,10 +44,11 @@ VSVersionInfo(
   ]
 )
 """ % {"tup": tup, "v": version}
-    with open(os.path.join(OUT_DIR, "version_info.txt"), "w", encoding="utf-8") as fh:
+    path = os.path.join(out_dir, "version_info.txt")
+    with open(path, "w", encoding="utf-8") as fh:
         fh.write(text)
-    print(version)
+    return path
 
 
 if __name__ == "__main__":
-    main()
+    print(read_version())

@@ -1,4 +1,4 @@
-name: Build Windows EXE
+name: Build Windows EXE + macOS App
 
 # Läuft bei jedem Push und manuell (Actions › "Run workflow").
 # Ein GitHub-Release wird nur erzeugt, wenn es für die Versionsnummer
@@ -11,8 +11,11 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  windows:
+    name: Windows-exe
     runs-on: windows-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
     steps:
       - name: Quellcode holen
         uses: actions/checkout@v4
@@ -36,44 +39,96 @@ jobs:
           "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           Write-Host "Version: $v"
 
-      - name: EXE bauen (PyInstaller)
+      - name: EXE bauen (PyInstaller, Editor-Darkmode-MK1.spec)
         shell: pwsh
-        run: |
-          python -m PyInstaller --noconfirm --clean --onefile --windowed `
-            --name Editor-Darkmode-MK1 `
-            --icon assets/editor.ico `
-            --add-data "assets/editor.ico;assets" `
-            --version-file build/version_info.txt `
-            editor_darkmode.py
+        run: python -m PyInstaller --noconfirm --clean Editor-Darkmode-MK1.spec
 
-      - name: Paket schnüren
+      - name: Dateien benennen
         shell: pwsh
         run: |
           $v = "${{ steps.ver.outputs.version }}"
-          New-Item -ItemType Directory -Force -Path release | Out-Null
-          Copy-Item dist/Editor-Darkmode-MK1.exe release/
-          Copy-Item README.md release/
-          Compress-Archive -Path release/* -DestinationPath "Editor-Darkmode-MK1-v$v-windows.zip" -Force
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          Copy-Item dist/Editor-Darkmode-MK1.exe "out/Editor-Darkmode-MK1-v$v-windows.exe"
 
       - name: Artefakt hochladen
         uses: actions/upload-artifact@v4
         with:
-          name: Editor-Darkmode-MK1-v${{ steps.ver.outputs.version }}-windows
-          path: release/
+          name: windows
+          path: out/
+
+  macos:
+    name: macOS-App
+    runs-on: macos-latest   # Apple Silicon (arm64)
+    steps:
+      - name: Quellcode holen
+        uses: actions/checkout@v4
+
+      - name: Python einrichten
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Tk prüfen
+        run: python -c "import tkinter; print('Tk', tkinter.TkVersion)"
+
+      - name: Build-Werkzeuge installieren
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-build.txt
+
+      - name: App bauen (PyInstaller, Editor-Darkmode-MK1.spec)
+        run: python -m PyInstaller --noconfirm --clean Editor-Darkmode-MK1.spec
+
+      - name: App packen
+        run: |
+          V=$(python tools/make_version_info.py)
+          mkdir -p out
+          # ditto erhält Symlinks und Signatur des App-Bundles
+          ditto -c -k --sequesterRsrc --keepParent dist/Editor-Darkmode-MK1.app \
+            "out/Editor-Darkmode-MK1-v$V-macos.zip"
+
+      - name: Artefakt hochladen
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: out/
+
+  release:
+    name: Release
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Quellcode holen
+        uses: actions/checkout@v4
+
+      - name: Artefakte holen
+        uses: actions/download-artifact@v4
+        with:
+          path: artefakte
+
+      - name: Offline-Build-Kit packen
+        run: |
+          V="${{ needs.windows.outputs.version }}"
+          cd offline_build_kit
+          zip -r "../artefakte/Editor-Darkmode-MK1-v$V-offline-build-kit.zip" . -x "*.DS_Store"
 
       - name: Release erstellen (nur bei neuer Version)
-        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="v${{ steps.ver.outputs.version }}"
+          TAG="v${{ needs.windows.outputs.version }}"
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "Release $TAG existiert bereits – es wird kein neues Release erstellt."
             exit 0
           fi
           gh release create "$TAG" \
-            "Editor-Darkmode-MK1-$TAG-windows.zip" \
-            "dist/Editor-Darkmode-MK1.exe" \
+            artefakte/windows/*.exe \
+            artefakte/macos/*.zip \
+            artefakte/*-offline-build-kit.zip \
             --target "$GITHUB_SHA" \
             --title "Editor-Darkmode-MK1 $TAG" \
-            --notes "Windows-Build von Editor-Darkmode-MK1 $TAG (Nachbau des Windows-10-Editors mit Dark Mode)."
+            --notes "Editor-Darkmode-MK1 $TAG – Nachbau des Windows-10-Editors mit Dark Mode.
+
+          * Windows: \`Editor-Darkmode-MK1-$TAG-windows.exe\`
+          * macOS (Apple Silicon): \`Editor-Darkmode-MK1-$TAG-macos.zip\` entpacken, App per Rechtsklick › Öffnen starten
+          * Offline-Build-Kit: exe und Mac-App ohne GitHub bauen"

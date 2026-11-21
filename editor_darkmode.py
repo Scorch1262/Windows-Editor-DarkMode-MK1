@@ -9,6 +9,10 @@ Dashboards (Lattice-Optik, Teal-/Amber-Akzente).
 * Nur Python-Standardbibliothek (tkinter) – keine externen Pakete nötig.
 * Einstellungen werden menschenlesbar in "Editor-Darkmode-MK1.ini" neben der
   exe abgelegt (falls der Ordner nicht beschreibbar ist: %APPDATA%).
+  macOS: ~/Library/Application Support/Editor-Darkmode-MK1/ (oder neben der
+  .app, wenn dort bereits eine INI-Datei liegt).
+* Läuft unverändert als Windows-exe und als macOS-App (Cmd-Tasten, Rechtsklick,
+  Drag & Drop per tkinterdnd2, Öffnen über Finder/Dock).
 * Aufruf mit Dateipfad als Argument öffnet die Datei direkt
   (z. B. für "Öffnen mit …").
 """
@@ -29,9 +33,10 @@ from tkinter import font as tkfont
 
 APP_TITLE = "Editor"
 APP_ID = "Editor-Darkmode-MK1"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 
 IS_WIN = sys.platform.startswith("win")
+IS_MAC = sys.platform == "darwin"
 
 if IS_WIN:
     import ctypes
@@ -60,11 +65,35 @@ C = {
     "thumb_hover": "#3a424e",
 }
 
-UI_FAMILY = "Segoe UI" if IS_WIN else "DejaVu Sans"
-MONO_FAMILY = "Consolas" if IS_WIN else "DejaVu Sans Mono"
-UI_FONT = (UI_FAMILY, 9)
-UI_FONT_MSG = (UI_FAMILY, 10)
-STATUS_FONT = (MONO_FAMILY, 9)
+if IS_WIN:
+    UI_FAMILY, MONO_FAMILY = "Segoe UI", "Consolas"
+elif IS_MAC:
+    UI_FAMILY, MONO_FAMILY = "Helvetica Neue", "Menlo"
+else:
+    UI_FAMILY, MONO_FAMILY = "DejaVu Sans", "DejaVu Sans Mono"
+
+
+def fs(size):
+    """Schriftgrößen: macOS rechnet mit 72 dpi, Windows mit 96 dpi – gleich groß darstellen."""
+    return int(round(size * 1.33)) if IS_MAC else size
+
+
+UI_FONT = (UI_FAMILY, fs(9))
+UI_FONT_MSG = (UI_FAMILY, fs(10))
+STATUS_FONT = (MONO_FAMILY, fs(9))
+
+# Tastenkürzel-Beschriftung: Windows-Schreibweise, auf dem Mac mit Symbolen
+_MAC_KEYS = (("Strg+Umschalt+", "\u21e7\u2318"), ("Strg+Plus", "\u2318+"),
+             ("Strg+Minus", "\u2318\u2212"), ("Strg+", "\u2318"),
+             ("Umschalt+", "\u21e7"), ("Entf", "\u2326"))
+
+
+def acc(text):
+    if not IS_MAC or not text:
+        return text
+    for win, mac in _MAC_KEYS:
+        text = text.replace(win, mac)
+    return text
 
 ENCODINGS = ["UTF-8", "UTF-8 mit BOM", "UTF-16 LE", "UTF-16 BE", "ANSI"]
 ENCODING_CODEC = {
@@ -87,7 +116,21 @@ FILETYPES = [("Textdokumente (*.txt)", "*.txt"), ("Alle Dateien (*.*)", "*.*")]
 # ---------------------------------------------------------------------------
 # Hilfsfunktionen
 # ---------------------------------------------------------------------------
+def mac_bundle_path():
+    """Pfad der .app (nur gebaute macOS-App), sonst None."""
+    if IS_MAC and getattr(sys, "frozen", False):
+        path = os.path.abspath(sys.executable)
+        for _ in range(3):  # .../Name.app/Contents/MacOS/Name
+            path = os.path.dirname(path)
+        if path.endswith(".app"):
+            return path
+    return None
+
+
 def app_dir():
+    bundle = mac_bundle_path()
+    if bundle:
+        return os.path.dirname(bundle)
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
@@ -110,7 +153,13 @@ def enable_dpi_awareness():
 
 
 def dark_titlebar(win):
-    """Dunkle Windows-Titelleiste (Win10 ab 1809 / Win11)."""
+    """Dunkle Titelleiste (Windows 10 ab 1809 / Windows 11 / macOS)."""
+    if IS_MAC:
+        try:
+            win.tk.call("::tk::unsupported::MacWindowStyle", "appearance", win._w, "darkaqua")
+        except tk.TclError:
+            pass
+        return
     if not IS_WIN:
         return
     try:
@@ -192,6 +241,16 @@ def win_set_clipboard_text(text, hwnd=None):
         return False
 
 
+def mac_set_clipboard_text(text):
+    """macOS: Text über pbcopy dauerhaft in die Zwischenablage legen."""
+    try:
+        env = dict(os.environ, LANG="en_US.UTF-8", LC_CTYPE="UTF-8")
+        res = subprocess.run(["pbcopy"], input=text.encode("utf-8"), env=env, timeout=5)
+        return res.returncode == 0
+    except Exception:
+        return False
+
+
 def win_clipboard_owned_by_us():
     if not IS_WIN:
         return False
@@ -235,8 +294,9 @@ def work_area(widget, x, y):
 
 class FileDropTarget:
     """
-    Nimmt per Drag & Drop aus dem Explorer gezogene Dateien an (WM_DROPFILES).
-    Die Fensterprozeduren der Tk-Fenster werden dazu per ctypes umgeleitet.
+    Nimmt per Drag & Drop gezogene Dateien an.
+    Windows: WM_DROPFILES – die Fensterprozeduren der Tk-Fenster werden dazu per
+    ctypes umgeleitet. macOS/Linux: tkinterdnd2 (tkdnd), falls installiert.
     Im Callback wird bewusst kein Tk aufgerufen – die Dateien landen in einer
     Warteschlange, die das Hauptfenster regelmäßig abholt.
     """
@@ -250,6 +310,8 @@ class FileDropTarget:
         self.queue = []
         self._hooks = {}
         self.available = False
+        self._tkdnd = None      # None = noch nicht geprüft, False = nicht vorhanden
+        self._tkdnd_done = set()
         if not IS_WIN:
             return
         try:
@@ -285,8 +347,45 @@ class FileDropTarget:
         except Exception:
             self.available = False
 
+    # -- macOS / Linux: tkinterdnd2 (tkdnd) -------------------------------
+    def _load_tkdnd(self, widget):
+        if self._tkdnd is None:
+            self._tkdnd = False
+            try:
+                from tkinterdnd2 import TkinterDnD
+                TkinterDnD._require(widget.winfo_toplevel())
+                self._tkdnd = True
+            except Exception:
+                self._tkdnd = False
+        return self._tkdnd
+
+    def _register_tkdnd(self, widget):
+        if not self._load_tkdnd(widget) or str(widget) in self._tkdnd_done:
+            return
+        try:
+            def on_drop(data):
+                try:
+                    self.queue.extend(widget.tk.splitlist(data))
+                except Exception:
+                    pass
+                return "copy"  # tkdnd erwartet die ausgeführte Aktion als Rückgabe
+
+            cmd = widget.register(on_drop)
+            widget.tk.call("tkdnd::drop_target", "register", widget._w, ("DND_Files",))
+            widget.tk.call("bind", widget._w, "<<Drop:DND_Files>>", cmd + " %D")
+            self._tkdnd_done.add(str(widget))
+        except Exception:
+            pass
+
+    @property
+    def supported(self):
+        return bool(self.available or self._tkdnd)
+
     def register(self, widget, include_frame=False):
         """Fenster eines Tk-Widgets (optional samt äußerem Rahmenfenster) anmelden."""
+        if not IS_WIN:
+            self._register_tkdnd(widget)
+            return
         if not self.available:
             return
         try:
@@ -377,8 +476,8 @@ def normalize_eol(text):
 # ---------------------------------------------------------------------------
 class Settings:
     DEFAULTS = {
-        "font_family": "Consolas",
-        "font_size": "11",
+        "font_family": MONO_FAMILY if IS_MAC else "Consolas",
+        "font_size": "14" if IS_MAC else "11",
         "font_weight": "normal",
         "font_slant": "roman",
         "word_wrap": "0",
@@ -405,9 +504,16 @@ class Settings:
     def _choose_path(self):
         name = APP_ID + ".ini"
         primary = os.path.join(app_dir(), name)
-        if os.path.exists(primary) or self._writable(app_dir()):
+        if os.path.exists(primary):
             return primary
-        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+        if IS_MAC:
+            # macOS: Programmordner ist meist schreibgeschützt bzw. "verschoben"
+            # (App Translocation) – daher Application Support des Benutzers.
+            base = os.path.expanduser("~/Library/Application Support")
+        else:
+            if self._writable(app_dir()):
+                return primary
+            base = os.environ.get("APPDATA") or os.path.expanduser("~")
         folder = os.path.join(base, APP_ID)
         try:
             os.makedirs(folder, exist_ok=True)
@@ -519,7 +625,7 @@ class MessageDialog(DarkDialog):
         color = {"warn": C["amber"], "error": C["danger"]}.get(kind, C["accent"])
         icon.create_oval(3, 3, 27, 27, outline=color, width=2)
         icon.create_text(15, 15, text="!" if kind in ("warn", "error") else "i",
-                         fill=color, font=(UI_FAMILY, 11, "bold"))
+                         fill=color, font=(UI_FAMILY, fs(11), "bold"))
         icon.pack(side="left", anchor="n", padx=(0, 14))
         ttk.Label(row, text=message, style="Msg.TLabel", wraplength=380,
                   justify="left").pack(side="left", fill="x", anchor="w", pady=(4, 0))
@@ -839,11 +945,11 @@ class DarkMenu:
 
     def add_command(self, label, command=None, accelerator=""):
         self.items.append({"kind": "command", "label": label, "command": command,
-                           "accel": accelerator, "state": "normal"})
+                           "accel": acc(accelerator), "state": "normal"})
 
     def add_checkbutton(self, label, variable, command=None, accelerator=""):
         self.items.append({"kind": "check", "label": label, "variable": variable,
-                           "command": command, "accel": accelerator, "state": "normal"})
+                           "command": command, "accel": acc(accelerator), "state": "normal"})
 
     def add_radiobutton(self, label, value, variable, command=None):
         self.items.append({"kind": "radio", "label": label, "value": value,
@@ -876,6 +982,12 @@ class MenuView:
         win.withdraw()
         win.overrideredirect(True)
         win.configure(bg=C["border"], bd=0, highlightthickness=0)
+        if IS_MAC:  # Menüfenster soll das Hauptfenster nicht deaktivieren
+            try:
+                win.tk.call("::tk::unsupported::MacWindowStyle", "style", win._w,
+                            "help", "noActivates")
+            except tk.TclError:
+                pass
         try:
             win.attributes("-topmost", True)
         except tk.TclError:
@@ -897,7 +1009,7 @@ class MenuView:
             if it["kind"] == "check" and it["variable"].get():
                 mark = "✓"
             elif it["kind"] == "radio" and it["variable"].get() == it["value"]:
-                mark, mark_font = "●", (UI_FAMILY, 7)
+                mark, mark_font = "●", (UI_FAMILY, fs(7))
             cells = [
                 tk.Label(inner, text=mark, font=mark_font, width=3, anchor="center",
                          fg=C["faint"] if disabled else C["accent"]),
@@ -906,7 +1018,7 @@ class MenuView:
                 tk.Label(inner, text=it.get("accel", ""), font=UI_FONT, anchor="e",
                          fg=C["faint"] if disabled else C["dim"], padx=12),
                 tk.Label(inner, text="›" if it["kind"] == "cascade" else "",
-                         font=(UI_FAMILY, 10), width=2, anchor="w", fg=fg),
+                         font=(UI_FAMILY, fs(10)), width=2, anchor="w", fg=fg),
             ]
             row = {"item": it, "cells": cells, "disabled": disabled}
             for col, cell in enumerate(cells):
@@ -963,6 +1075,7 @@ class MenuView:
 
 class MenuManager:
     """Öffnet/schließt Menüs, Maus- und Tastatursteuerung wie unter Windows."""
+    KEYTAG = "DarkMenuKeys"
 
     def __init__(self, app):
         self.app = app
@@ -970,6 +1083,16 @@ class MenuManager:
         self.chain = []
         self.bar_index = None
         self._job = None
+        self._keys = (("<Down>", lambda: self._key_move(1)), ("<Up>", lambda: self._key_move(-1)),
+                      ("<Right>", self._key_right), ("<Left>", self._key_left),
+                      ("<Return>", self._key_enter), ("<KP_Enter>", self._key_enter),
+                      ("<space>", self._key_enter), ("<Escape>", self._key_escape),
+                      ("<F10>", self.close_all))
+        # Tastatur-Umweg über das Textfeld, solange ein Menü offen ist (nötig auf
+        # dem Mac, wo randlose Menüfenster keinen Tastaturfokus bekommen).
+        for key, fn in self._keys:
+            self.root.bind_class(self.KEYTAG, key, lambda e, f=fn: (f(), "break")[1])
+        self.root.bind_class(self.KEYTAG, "<KeyPress>", lambda e: "break")
 
     @property
     def is_open(self):
@@ -1001,8 +1124,16 @@ class MenuManager:
         if keyboard:
             view.move(1)
 
+    def _key_tag(self, on):
+        try:
+            tags = tuple(t for t in self.app.text.bindtags() if t != self.KEYTAG)
+            self.app.text.bindtags(((self.KEYTAG,) + tags) if on else tags)
+        except tk.TclError:
+            pass
+
     def _start(self, view, x, y, flip_y=None):
         self.chain = [view]
+        self._key_tag(True)
         self._bind(view)
         view.show(x, y, flip_y=flip_y)
         self._grab(view, 0)
@@ -1012,7 +1143,8 @@ class MenuManager:
             return
         try:
             view.win.grab_set()
-            view.win.focus_force()
+            if not IS_MAC:
+                view.win.focus_force()
         except tk.TclError:
             if tries < 10:
                 view.win.after(20, lambda: self._grab(view, tries + 1))
@@ -1044,6 +1176,7 @@ class MenuManager:
         for v in reversed(self.chain):
             v.destroy()
         self.chain = []
+        self._key_tag(False)
         if self.bar_index is not None:
             try:
                 self.app.menu_labels[self.bar_index][0].configure(bg=C["panel"])
@@ -1071,12 +1204,9 @@ class MenuManager:
         w.bind("<ButtonPress-1>", self._on_press)
         w.bind("<ButtonPress-3>", self._on_press)
         w.bind("<ButtonRelease-1>", self._on_release)
-        w.bind("<FocusOut>", lambda e: self.root.after(80, self._check_focus))
-        for key, fn in (("<Down>", lambda: self._key_move(1)), ("<Up>", lambda: self._key_move(-1)),
-                        ("<Right>", self._key_right), ("<Left>", self._key_left),
-                        ("<Return>", self._key_enter), ("<KP_Enter>", self._key_enter),
-                        ("<space>", self._key_enter), ("<Escape>", self._key_escape),
-                        ("<F10>", self.close_all)):
+        if not IS_MAC:
+            w.bind("<FocusOut>", lambda e: self.root.after(80, self._check_focus))
+        for key, fn in self._keys:
             w.bind(key, lambda e, f=fn: (f(), "break")[1])
 
     def _widget_at(self, x, y):
@@ -1280,6 +1410,15 @@ class EditorApp:
             except tk.TclError:
                 pass
         r.protocol("WM_DELETE_WINDOW", self.exit_app)
+        if IS_MAC:
+            try:
+                # Cmd+Q / Beenden im App-Menü: wie Schließen (mit Speichern-Rückfrage)
+                r.createcommand("tk::mac::Quit", self.exit_app)
+                # Dateien aus dem Finder ("Öffnen mit", aufs Dock-Symbol gezogen)
+                r.createcommand("::tk::mac::OpenDocument",
+                                lambda *paths: self.drop.queue.extend(paths))
+            except tk.TclError:
+                pass
 
     def _setup_style(self):
         st = ttk.Style(self.root)
@@ -1294,9 +1433,9 @@ class EditorApp:
         st.configure("Dlg.TLabel", background=C["panel"], foreground=C["text"])
         st.configure("Msg.TLabel", background=C["panel"], foreground=C["text"], font=UI_FONT_MSG)
         st.configure("Title.TLabel", background=C["panel"], foreground=C["text"],
-                     font=(UI_FAMILY, 15, "bold"))
+                     font=(UI_FAMILY, fs(15), "bold"))
         st.configure("TitleDim.TLabel", background=C["panel"], foreground=C["dim"],
-                     font=(UI_FAMILY, 15))
+                     font=(UI_FAMILY, fs(15)))
 
         st.configure("TButton", background=C["card"], foreground=C["text"],
                      bordercolor=C["border"], lightcolor=C["card"], darkcolor=C["card"],
@@ -1560,7 +1699,10 @@ class EditorApp:
         t = self.text
 
         def bind(seqs, func):
-            for seq in seqs:
+            all_seqs = list(seqs)
+            if IS_MAC:  # auf dem Mac zusätzlich mit der Cmd-Taste
+                all_seqs += [q.replace("Control-", "Command-") for q in seqs if "Control-" in q]
+            for seq in all_seqs:
                 try:
                     t.bind(seq, lambda e, f=func: (f(e), "break")[1])
                 except tk.TclError:
@@ -1609,9 +1751,21 @@ class EditorApp:
         t.bind("<Control-Button-4>", lambda e: (self.zoom_in(), "break")[1])
         t.bind("<Control-Button-5>", lambda e: (self.zoom_out(), "break")[1])
         t.bind("<Button-3>", self._context_menu)
+        if IS_MAC:
+            # Rechtsklick auf dem Mac: Tk 8.6 meldet ihn als Taste 2, dazu Ctrl+Klick
+            for seq, fn in (("<Command-MouseWheel>",
+                             lambda e: (self.zoom_in() if e.delta > 0 else self.zoom_out(),
+                                        "break")[1]),
+                            ("<Button-2>", self._context_menu),
+                            ("<Control-Button-1>", self._context_menu)):
+                try:
+                    t.bind(seq, fn)
+                except tk.TclError:
+                    pass
 
-        # Menüleiste per Alt-Taste / F10
-        for idx, (lbl, _m, _p) in enumerate(self.menu_labels):
+        # Menüleiste per Alt-Taste / F10 (auf dem Mac nicht: Option+Taste erzeugt
+        # dort Sonderzeichen wie @ oder {)
+        for idx, (lbl, _m, _p) in enumerate(self.menu_labels if not IS_MAC else []):
             ch = lbl.cget("text")[lbl.cget("underline")].lower()
             for seq in ("<Alt-%s>" % ch, "<Alt-%s>" % ch.upper()):
                 self.root.bind_all(seq, lambda e, i=idx: self.open_menu(i, keyboard=True))
@@ -1691,6 +1845,9 @@ class EditorApp:
                 cmd = [sys.executable, os.path.abspath(__file__)]
             if path:
                 cmd.append(path)
+            bundle = mac_bundle_path()
+            if bundle:  # macOS-App: zweite Instanz über "open -n"
+                cmd = ["open", "-n", bundle] + (["--args", path] if path else [])
             flags = 0x00000008 if IS_WIN else 0  # DETACHED_PROCESS
             subprocess.Popen(cmd, cwd=app_dir(), creationflags=flags, close_fds=True)
         except Exception as exc:
@@ -1819,8 +1976,9 @@ class EditorApp:
         return True
 
     def print_file(self):
-        if not IS_WIN:
-            show_message(self.root, "Drucken wird nur unter Windows unterstützt.", kind="warn")
+        if not (IS_WIN or IS_MAC):
+            show_message(self.root, "Drucken wird nur unter Windows und macOS unterstützt.",
+                         kind="warn")
             return
         res = ask(self.root, 'Das Dokument "%s" wird an den Standarddrucker gesendet.'
                   % self._display_name(),
@@ -1837,7 +1995,15 @@ class EditorApp:
             tmp = os.path.join(folder, base + ".txt")
             with open(tmp, "wb") as fh:
                 fh.write(data)
-            os.startfile(tmp, "print")  # noqa: S606 – nur Windows
+            if IS_WIN:
+                os.startfile(tmp, "print")  # noqa: S606 – nur Windows
+            else:
+                if IS_MAC and self.encoding not in ("UTF-8", "UTF-8 mit BOM"):
+                    with open(tmp, "wb") as fh:  # CUPS druckt Text als UTF-8
+                        fh.write(self.text.get("1.0", "end-1c").encode("utf-8", "replace"))
+                res = subprocess.run(["lpr", tmp], capture_output=True, text=True)
+                if res.returncode != 0:
+                    raise RuntimeError(res.stderr.strip() or "lpr meldet einen Fehler")
         except Exception as exc:
             show_message(self.root, "Drucken fehlgeschlagen:\n%s" % exc, kind="error")
 
@@ -1892,6 +2058,8 @@ class EditorApp:
             return None
 
     def set_clipboard(self, text):
+        if IS_MAC and mac_set_clipboard_text(text):
+            return
         if not win_set_clipboard_text(text, self._owner_hwnd()):
             self.root.clipboard_clear()
             self.root.clipboard_append(text)
@@ -1911,7 +2079,7 @@ class EditorApp:
     def _keep_clipboard(self):
         """Vor dem Beenden: von Tk gehaltenen Text dauerhaft in die Zwischenablage legen
         (betrifft z. B. Kopieren aus den Eingabefeldern der Dialoge)."""
-        if not win_clipboard_owned_by_us():
+        if not (IS_WIN and win_clipboard_owned_by_us()):
             return
         try:
             text = self.root.clipboard_get()
@@ -2148,7 +2316,8 @@ def main():
     enable_dpi_awareness()
     root = tk.Tk()
     root.withdraw()
-    path = sys.argv[1] if len(sys.argv) > 1 else None
+    args = [a for a in sys.argv[1:] if not a.startswith("-psn_")]  # macOS-Startparameter
+    path = args[0] if args else None
     EditorApp(root, path)
     root.update_idletasks()
     dark_titlebar(root)

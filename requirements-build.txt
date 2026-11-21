@@ -1,2 +1,6 @@
-# Nur für den Build der exe nötig – das Programm selbst nutzt ausschließlich die Standardbibliothek.
-pyinstaller>=6.6
+# Pakete für den Build (Windows-exe und macOS-App). Fest auf Versionen gesetzt,
+# damit GitHub Actions und das Offline-Build-Kit exakt gleich bauen.
+# Das Programm selbst braucht unter Windows nur die Standardbibliothek.
+pyinstaller==6.16.0
+# Nur macOS: Drag & Drop von Dateien auf das Fenster
+tkinterdnd2==0.7.0; sys_platform == "darwin"
